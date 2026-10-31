@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
 use ratatui::crossterm::execute;
@@ -153,14 +153,22 @@ fn restore_terminal() {
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     loop {
         app.receive();
-        terminal.draw(|f| ui::draw(f, app))?;
+        let mut targets = ui::MouseTargets::default();
+        terminal.draw(|f| targets = ui::draw(f, app))?;
         // handle everything that's waiting, so fast scrolling or typing never lags behind
         let mut wait = Duration::from_millis(80);
+        let mut stale = false;
         while event::poll(wait)? {
             wait = Duration::ZERO;
-            let next = match event::read()? {
+            let ev = event::read()?;
+            // an earlier event may have changed the layout, so redraw before hit-testing a click
+            if stale && matches!(&ev, Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left)) {
+                terminal.draw(|f| targets = ui::draw(f, app))?;
+            }
+            stale = true;
+            let next = match ev {
                 Event::Key(k) if k.kind == KeyEventKind::Press => on_key(app, k),
-                Event::Mouse(m) => on_mouse(app, m),
+                Event::Mouse(m) => on_mouse(app, m, &targets),
                 _ => Next::Continue,
             };
             match next {
@@ -224,7 +232,20 @@ const WHEEL_LINES: isize = 3;
 /// so they don't move the dashboard selection.
 const MOMENTUM: Duration = Duration::from_millis(400);
 
-fn on_mouse(app: &mut App, m: MouseEvent) -> Next {
+fn on_mouse(app: &mut App, m: MouseEvent, targets: &ui::MouseTargets) -> Next {
+    if m.kind == MouseEventKind::Down(MouseButton::Left) {
+        match targets.at(m.column, m.row) {
+            Some(ui::MouseTarget::Job(ci, id)) => app.select(*ci, id.clone()),
+            Some(ui::MouseTarget::Palette(index)) => {
+                if let Some(level) = app.palette.as_mut().and_then(|p| p.level()) {
+                    level.sel = *index;
+                    return palette_key(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+            }
+            _ => {}
+        }
+        return Next::Continue;
+    }
     let delta: isize = match m.kind {
         MouseEventKind::ScrollUp => -1,
         MouseEventKind::ScrollDown => 1,

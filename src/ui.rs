@@ -59,7 +59,22 @@ fn clear(f: &mut Frame, area: Rect) {
     }
 }
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub enum MouseTarget {
+    Job(usize, String),
+    Palette(usize),
+}
+
+#[derive(Default)]
+pub struct MouseTargets(Vec<(Rect, MouseTarget)>);
+
+impl MouseTargets {
+    pub fn at(&self, column: u16, row: u16) -> Option<&MouseTarget> {
+        self.0.iter().find(|(area, _)| area.contains(Position::new(column, row))).map(|(_, target)| target)
+    }
+}
+
+pub fn draw(f: &mut Frame, app: &App) -> MouseTargets {
+    let mut targets = MouseTargets::default();
     if let Some(bg) = t().background {
         f.render_widget(Block::new().style(Style::new().bg(bg).fg(t().text)), f.area());
     }
@@ -72,10 +87,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     .areas(f.area());
 
     draw_header(f, head, app);
-    draw_clusters(f, body, app);
+    draw_clusters(f, body, app, &mut targets);
     draw_detail(f, detail, app);
     draw_footer(f, foot, app);
 
+    if app.log.is_some() || app.popup.is_some() || app.palette.is_some() {
+        targets.0.clear();
+    }
     if let Some(v) = &app.log {
         draw_log(f, app, v);
     }
@@ -85,8 +103,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         None => {}
     }
     if let Some(p) = &app.palette {
-        draw_palette(f, app, p);
+        draw_palette(f, app, p, &mut targets);
     }
+    targets
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -122,7 +141,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(right).right_aligned()), area);
 }
 
-fn draw_clusters(f: &mut Frame, area: Rect, app: &App) {
+fn draw_clusters(f: &mut Frame, area: Rect, app: &App, targets: &mut MouseTargets) {
     let visible: Vec<Vec<&Job>> = app.clusters.iter().map(|c| app.visible(c)).collect();
     let heights: Vec<u16> = visible
         .iter()
@@ -135,11 +154,11 @@ fn draw_clusters(f: &mut Frame, area: Rect, app: &App) {
     };
     let areas = Layout::vertical(constraints).split(area);
     for (i, c) in app.clusters.iter().enumerate() {
-        draw_cluster(f, areas[i], app, i, c, &visible[i]);
+        draw_cluster(f, areas[i], app, i, c, &visible[i], targets);
     }
 }
 
-fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jobs: &[&Job]) {
+fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jobs: &[&Job], targets: &mut MouseTargets) {
     let mut title = vec![Span::styled(format!(" {} ", c.host), Style::new().fg(t().text).bold())];
     if let Some(all) = &c.jobs {
         let r = all.iter().filter(|j| j.running()).count();
@@ -201,6 +220,7 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
             state.select(jobs.iter().position(|j| &j.id == id));
         }
     }
+    let inner = block.inner(area);
     let table = Table::new(rows, widths)
         .header(header)
         .block(block)
@@ -208,6 +228,13 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
         .highlight_symbol(Span::styled("▌", Style::new().fg(t().accent)))
         .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, area, &mut state);
+    // Use the offset chosen by ratatui, including when the table is clipped.
+    for (row, job) in jobs.iter().skip(state.offset()).take(inner.height.saturating_sub(1) as usize).enumerate() {
+        targets.0.push((
+            Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1),
+            MouseTarget::Job(ci, job.id.clone()),
+        ));
+    }
 }
 
 fn job_row(j: &Job, prefix: &str, since: u64) -> Row<'static> {
@@ -467,6 +494,7 @@ fn draw_help(f: &mut Frame) {
     let rows = [
         ("↑ ↓  j k", "move"),
         ("p  :", "command palette: every action and setting"),
+        ("click", "select a job or run a palette item"),
         ("g G", "first / last job"),
         ("enter  l", "open the job's log (h or esc to go back)"),
         ("s", "shell into the job (its GPU node if running)"),
@@ -505,7 +533,7 @@ fn draw_confirm(f: &mut Frame, host: &str, id: &str, name: &str) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_palette(f: &mut Frame, app: &App, p: &Palette) {
+fn draw_palette(f: &mut Frame, app: &App, p: &Palette, targets: &mut MouseTargets) {
     if let Some(prompt) = &p.prompt {
         let area = centered(f.area(), 64, 7);
         clear(f, area);
@@ -586,4 +614,10 @@ fn draw_palette(f: &mut Frame, app: &App, p: &Palette) {
         .highlight_symbol("▌")
         .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(list, list_area, &mut state);
+    for row in 0..list_area.height.min(items.len().saturating_sub(state.offset()) as u16) {
+        targets.0.push((
+            Rect::new(list_area.x, list_area.y + row, list_area.width, 1),
+            MouseTarget::Palette(state.offset() + row as usize),
+        ));
+    }
 }

@@ -120,9 +120,10 @@ gpudash saves them, so next time plain `gpudash` shows them all.
 | `r`           | refresh now                                     |
 | `?`           | all keys                                        |
 | `q`           | quit                                            |
+| left click    | select a job, or run a command palette item      |
 | scroll wheel  | move, or scroll the log                         |
 
-gpudash uses the mouse wheel, so to select text in the terminal hold **Shift** while dragging.
+gpudash uses the mouse, so to select text in the terminal hold **Shift** while dragging.
 
 ## Configuration
 

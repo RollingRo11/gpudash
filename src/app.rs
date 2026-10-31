@@ -423,6 +423,11 @@ impl App {
         }
     }
 
+    pub fn select(&mut self, ci: usize, id: String) {
+        self.selected = Some((ci, id));
+        self.moved = true;
+    }
+
     pub fn step(&mut self, delta: isize) {
         let flat = self.flat();
         if flat.is_empty() {
@@ -902,6 +907,91 @@ mod tests {
         Cluster {
             uid, host: "test".into(), prefix: String::new(), jobs: None, fetched: None,
             error: None, loading: false, loading_since: Instant::now(), outputs: HashMap::new(),
+        }
+    }
+
+    fn render(app: &App, width: u16, height: u16) -> (ratatui::Terminal<ratatui::backend::TestBackend>, crate::ui::MouseTargets) {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let mut targets = crate::ui::MouseTargets::default();
+        terminal.draw(|f| targets = crate::ui::draw(f, app)).unwrap();
+        (terminal, targets)
+    }
+
+    fn click(app: &mut App, targets: &crate::ui::MouseTargets, x: u16, y: u16) {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        crate::on_mouse(app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE,
+        }, targets);
+    }
+
+    #[test]
+    fn clicks_follow_rendered_rows_after_scrolling_and_filtering() {
+        let mut app = App::new(Config::default(), Vec::new());
+        for ci in 0..2 {
+            let mut c = test_cluster(ci);
+            c.jobs = Some((0..30).map(|i| job(&format!("{ci}-{i}"), "train", "PENDING")).collect());
+            app.clusters.push(c);
+        }
+        app.select(1, "1-25".into());
+        let (terminal, targets) = render(&app, 140, 26);
+        // Check the hit map against the actual text, not another layout calculation.
+        let mut clicked = 0;
+        for y in 0..26 {
+            if let Some(crate::ui::MouseTarget::Job(ci, id)) = targets.at(2, y) {
+                let (ci, id) = (*ci, id.clone());
+                let buffer = terminal.backend().buffer();
+                let line: String = (0..140).map(|x| buffer[(x, y)].symbol()).collect();
+                assert!(line.contains(&id), "row {y}: {line}");
+                click(&mut app, &targets, 2, y);
+                app.fix_selection();
+                assert_eq!(app.selected, Some((ci, id)));
+                clicked += 1;
+            }
+        }
+        assert!(clicked > 1);
+        app.filter = "1-29".into();
+        app.fix_selection();
+        let (_, targets) = render(&app, 140, 26);
+        let y = (0..26).find(|&y| targets.at(2, y).is_some()).unwrap();
+        click(&mut app, &targets, 2, y);
+        assert_eq!(app.selected, Some((1, "1-29".into())));
+        app.popup = Some(Popup::Help);
+        let (_, targets) = render(&app, 140, 26);
+        assert!((0..26).all(|y| targets.at(2, y).is_none()));
+    }
+
+    #[test]
+    fn palette_clicks_activate_the_visible_item_and_prompts_block_clicks() {
+        let mut app = App::new(Config::default(), Vec::new());
+        app.palette = Some(Palette::new());
+        // Select near the end to force the list to scroll in a short terminal.
+        app.palette.as_mut().unwrap().level().unwrap().sel = 100;
+        let (terminal, targets) = render(&app, 90, 12);
+        let mut tested = false;
+        for y in 0..12 {
+            if let Some(crate::ui::MouseTarget::Palette(index)) = targets.at(20, y) {
+                let items = crate::palette::search(&app, crate::palette::Menu::Root, "");
+                let item = &items[*index];
+                let line: String = (0..90).map(|x| terminal.backend().buffer()[(x, y)].symbol()).collect();
+                assert!(line.contains(&item.label));
+                // Use a submenu so activation has no persistent effects.
+                if let crate::palette::Act::Open(menu) = item.act {
+                    click(&mut app, &targets, 20, y);
+                    assert_eq!(app.palette.as_ref().unwrap().stack.last().unwrap().menu, menu);
+                    tested = true;
+                    break;
+                }
+            }
+        }
+        assert!(tested);
+        app.palette = Some(Palette::with_prompt(Prompt {
+            title: "Test".into(), help: String::new(), text: String::new(), kind: PromptKind::AddHost,
+        }));
+        let (_, targets) = render(&app, 90, 12);
+        assert!((0..12).all(|y| targets.at(20, y).is_none()));
+        // Tiny windows should never create targets outside their bounds or panic.
+        for (width, height) in [(0, 0), (1, 1), (20, 4)] {
+            render(&app, width, height);
         }
     }
 
