@@ -1,6 +1,6 @@
 //! Everything that talks to the clusters over ssh.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -61,6 +61,15 @@ impl Job {
     pub fn finished(&self) -> bool {
         self.end.is_some()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuCapacity {
+    pub partition: String,
+    pub kind: String,
+    pub total: u64,
+    pub allocated: u64,
+    pub unavailable: u64,
 }
 
 pub struct Snapshot {
@@ -304,6 +313,60 @@ fn parse_jobs(out: &str) -> Result<Snapshot, String> {
     Ok(Snapshot { jobs: active, outputs })
 }
 
+const CAPACITY_SCRIPT: &str = r#"
+nodes=$(timeout 8 sinfo -N -h -O 'NodeHost:0|,PartitionName:0|,StateLong:0|,Available:0|,Gres:0|,GresUsed:0' 2>/dev/null) || exit 1
+echo '@@CAPACITY'
+printf '%s' "$nodes" | sed 's/^/@@NODE|/'
+"#;
+
+pub fn fetch_capacity(host: &str) -> Result<Option<Vec<GpuCapacity>>, String> {
+    Ok(parse_capacity(&run(host, CAPACITY_SCRIPT)?))
+}
+
+/// Count each node once per partition; partitions can share nodes.
+fn parse_capacity(out: &str) -> Option<Vec<GpuCapacity>> {
+    if !out.lines().any(|line| line == "@@CAPACITY") { return None; }
+    let annotations = regex::Regex::new(r"\([^)]*\)").unwrap();
+    let counts = |value: &str| -> Option<BTreeMap<String, u64>> {
+        if matches!(value, "" | "(null)" | "N/A") { return Some(BTreeMap::new()); }
+        // Remove socket/index annotations (which can themselves contain commas).
+        let value = annotations.replace_all(value, "");
+        let mut counts = BTreeMap::new();
+        for item in value.split(',').filter(|s| s.starts_with("gpu:")) {
+            let (kind, count) = item[4..].rsplit_once(':').unwrap_or(("GPU", &item[4..]));
+            if kind.is_empty() || kind.contains(':') { return None; }
+            *counts.entry(kind.to_string()).or_default() += count.parse::<u64>().ok()?;
+        }
+        Some(counts)
+    };
+    let mut seen = HashSet::new();
+    let mut groups: BTreeMap<(String, String), GpuCapacity> = BTreeMap::new();
+    for line in out.lines().filter(|l| l.starts_with("@@NODE|")) {
+        let f: Vec<_> = line.split('|').map(str::trim).collect();
+        if f.len() != 7 || f[1].is_empty() || f[2].is_empty() { return None; }
+        if !seen.insert((f[1], f[2])) { continue; }
+        let total = counts(f[5])?;
+        if total.is_empty() { continue; }
+        // An absent usage value is unknown, not zero allocated.
+        if matches!(f[6], "" | "N/A" | "(null)") { return None; }
+        let used = counts(f[6])?;
+        if used.keys().ne(total.keys()) { return None; }
+        let healthy = f[4] == "up" && !f[3].contains('*') &&
+            matches!(f[3], "idle" | "allocated" | "mixed" | "completing");
+        for (kind, total) in total {
+            let allocated = used[&kind];
+            if allocated > total { return None; }
+            let group = groups.entry((f[2].into(), kind.clone())).or_insert_with(|| GpuCapacity {
+                partition: f[2].into(), kind, total: 0, allocated: 0, unavailable: 0,
+            });
+            group.total += total;
+            group.allocated += allocated;
+            if !healthy { group.unavailable += total - allocated; }
+        }
+    }
+    Some(groups.into_values().filter(|g| g.total > 0).collect())
+}
+
 /// Read the GPUs of running jobs: job id -> its GPUs.
 pub fn fetch_gpus(host: &str, ids: &[String]) -> Result<HashMap<String, Vec<Gpu>>, String> {
     if ids.is_empty() {
@@ -518,6 +581,50 @@ tail() {{ {tail} }}
         assert!(read("old\n", stamp, known, "missing.log", true).unwrap_err().contains("can't read"));
         // If stat fails, fall back to tailing instead of treating it as unchanged.
         assert!(read("old\n", "", Some(("train.log", "")), "train.log", false).unwrap().is_some());
+    }
+
+    #[test]
+    fn capacity_counts_nodes_types_and_unavailable_resources() {
+        let out = "@@CAPACITY
+@@NODE|n1|gpu|mixed|up|gpu:a100:4(S:0-1),gpu:h200:2|gpu:a100:2(IDX:0,1),gpu:h200:1(IDX:0)
+@@NODE|n1|gpu|mixed|up|gpu:a100:4(S:0-1),gpu:h200:2|gpu:a100:2(IDX:0,1),gpu:h200:1(IDX:0)
+@@NODE|n1|short|mixed|up|gpu:a100:4,gpu:h200:2|gpu:a100:2(IDX:0,1),gpu:h200:1(IDX:0)
+@@NODE|n2|gpu|drained|up|gpu:a100:4|gpu:a100:0(IDX:N/A)
+@@NODE|n3|gpu|idle|down|gpu:a100:4|gpu:a100:0(IDX:N/A)
+@@NODE|cpu1|cpu|idle|up|(null)|(null)";
+        let groups = parse_capacity(out).unwrap();
+        assert_eq!(groups, vec![
+            GpuCapacity { partition: "gpu".into(), kind: "a100".into(), total: 12, allocated: 2, unavailable: 8 },
+            GpuCapacity { partition: "gpu".into(), kind: "h200".into(), total: 2, allocated: 1, unavailable: 0 },
+            GpuCapacity { partition: "short".into(), kind: "a100".into(), total: 4, allocated: 2, unavailable: 0 },
+            GpuCapacity { partition: "short".into(), kind: "h200".into(), total: 2, allocated: 1, unavailable: 0 },
+        ]);
+        let generic = parse_capacity("@@CAPACITY\n@@NODE|n|gpu|idle*|up|gpu:4|gpu:0").unwrap();
+        assert_eq!(generic[0].unavailable, 4, "unresponsive nodes are not idle capacity");
+    }
+
+    #[test]
+    fn unknown_capacity_never_becomes_free_gpus() {
+        assert_eq!(parse_capacity(""), None);
+        assert_eq!(parse_capacity("@@CAPACITY"), Some(vec![]));
+        for used in ["N/A", "(null)", "", "gpu:a100:bad", "gpu:a100:5", "gpu:2", "mps:0"] {
+            assert_eq!(parse_capacity(&format!("@@CAPACITY\n@@NODE|n|gpu|idle|up|gpu:a100:4|{used}")), None, "{used}");
+        }
+    }
+
+    #[test]
+    fn capacity_script_only_marks_success() {
+        for fail in [false, true] {
+            let out = bash(&format!(r#"
+timeout() {{ shift; "$@"; }}
+sinfo() {{ if {fail}; then return 1; fi; echo 'n|gpu|mixed|up|gpu:a100:4|gpu:a100:2(IDX:0,1)'; }}
+(
+{CAPACITY_SCRIPT}
+) || true"#));
+            let capacity = parse_capacity(&out);
+            assert_eq!(capacity.is_none(), fail);
+            if !fail { assert_eq!(capacity.unwrap()[0].allocated, 2); }
+        }
     }
 
     #[test]

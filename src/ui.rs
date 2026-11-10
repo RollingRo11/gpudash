@@ -182,6 +182,32 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(right).right_aligned()), area);
 }
 
+fn capacity_lines(c: &Cluster) -> Vec<Line<'static>> {
+    if c.source.is_runpod() { return vec![]; }
+    let Some(groups) = &c.capacity else {
+        return vec![Line::from(dim(if c.capacity_loading { " loading GPU capacity…" } else { " GPU capacity unavailable" }))];
+    };
+    if groups.is_empty() { return vec![Line::from(dim(" no GPUs reported"))]; }
+    let labels: Vec<_> = groups.iter().map(|g| format!("{}  {}", g.partition, g.kind.replace('_', " ").to_uppercase())).collect();
+    let width = labels.iter().map(String::len).max().unwrap_or(0);
+    groups.iter().zip(labels).map(|(g, label)| {
+        let allocated = (g.allocated * 10 / g.total) as usize;
+        let unavailable = (g.unavailable * 10 / g.total) as usize;
+        let mut spans = vec![
+            text(format!(" {label:width$}  ")),
+            Span::styled("━".repeat(allocated), Style::new().fg(t().accent)),
+            Span::styled("━".repeat(unavailable), Style::new().fg(t().failed)),
+            Span::styled("·".repeat(10 - allocated - unavailable), Style::new().fg(t().faint)),
+            text(format!(" {}/{}", g.allocated, g.total)),
+            dim(format!("  {} idle", g.total - g.allocated - g.unavailable)),
+        ];
+        if g.unavailable > 0 {
+            spans.push(Span::styled(format!(" · {} unavailable", g.unavailable), Style::new().fg(t().failed)));
+        }
+        Line::from(spans)
+    }).collect()
+}
+
 fn draw_clusters(f: &mut Frame, area: Rect, app: &App, targets: &mut MouseTargets) {
     let shown: Vec<usize> = (0..app.clusters.len()).filter(|i| app.focus.is_none_or(|f| f == *i)).collect();
     let visible: Vec<Vec<&Job>> = shown.iter().map(|&i| app.visible(&app.clusters[i])).collect();
@@ -189,7 +215,9 @@ fn draw_clusters(f: &mut Frame, area: Rect, app: &App, targets: &mut MouseTarget
         .iter()
         .map(|v| v.len().saturating_add(3).min(u16::MAX as usize) as u16)
         .collect();
-    let constraints: Vec<Constraint> = if heights.iter().map(|&h| u32::from(h)).sum::<u32>() <= u32::from(area.height) {
+    let constraints: Vec<Constraint> = if app.focus.is_some_and(|i| !app.clusters[i].source.is_runpod()) {
+        vec![Constraint::Fill(1)]
+    } else if heights.iter().map(|&h| u32::from(h)).sum::<u32>() <= u32::from(area.height) {
         heights.iter().map(|&h| Constraint::Length(h)).chain([Constraint::Fill(1)]).collect()
     } else {
         heights.iter().map(|&h| Constraint::Fill(h)).collect()
@@ -240,6 +268,20 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
         block = block.title_top(Line::from(Span::styled(format!(" {ago}s ago "), Style::new().fg(t().faint))).right_aligned());
     }
 
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let mut lines = if app.focus == Some(ci) { capacity_lines(c) } else { vec![] };
+    // Leave room for the job header and up to three jobs.
+    let room = inner.height.saturating_sub(if jobs.is_empty() { 1 } else { 1 + jobs.len().min(3) as u16 }) as usize;
+    if lines.len() > room && room > 1 {
+        let hidden = lines.len() - room + 1;
+        lines.truncate(room - 1);
+        lines.push(Line::from(dim(format!(" +{hidden} more GPU groups"))));
+    }
+    lines.truncate(room);
+    let [summary, content] = Layout::vertical([Constraint::Length(lines.len() as u16), Constraint::Fill(1)]).areas(inner);
+    f.render_widget(Paragraph::new(lines), summary);
+
     if jobs.is_empty() {
         let msg = match (&c.jobs, c.loading) {
             (None, true) if c.source.is_runpod() => " waiting for Runpod…",
@@ -249,7 +291,7 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
             _ if c.source.is_runpod() => " no pods",
             _ => " no jobs",
         };
-        f.render_widget(Paragraph::new(dim(msg)).block(block), area);
+        f.render_widget(Paragraph::new(dim(msg)), content);
         return;
     }
 
@@ -275,18 +317,16 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
     {
         state.select(jobs.iter().position(|j| &j.id == id));
     }
-    let inner = block.inner(area);
     let table = Table::new(rows, widths)
         .header(header)
-        .block(block)
         .row_highlight_style(Style::new().bg(t().selection))
         .highlight_symbol(Span::styled("▌", Style::new().fg(t().accent)))
         .highlight_spacing(HighlightSpacing::Always);
-    f.render_stateful_widget(table, area, &mut state);
+    f.render_stateful_widget(table, content, &mut state);
     // Use the offset chosen by ratatui, including when the table is clipped.
-    for (row, job) in jobs.iter().skip(state.offset()).take(inner.height.saturating_sub(1) as usize).enumerate() {
+    for (row, job) in jobs.iter().skip(state.offset()).take(content.height.saturating_sub(1) as usize).enumerate() {
         targets.0.push((
-            Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1),
+            Rect::new(content.x, content.y + 1 + row as u16, content.width, 1),
             MouseTarget::Job(ci, job.id.clone()),
         ));
     }

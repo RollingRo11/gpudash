@@ -24,6 +24,9 @@ pub struct Cluster {
     /// stable id, so results from a fetch still land right after clusters are added or removed
     pub uid: usize,
     pub jobs: Option<Vec<Job>>,
+    pub capacity: Option<Vec<remote::GpuCapacity>>,
+    pub capacity_loading: bool,
+    capacity_checked: Option<Instant>,
     pub fetched: Option<Instant>,
     pub error: Option<String>,
     pub loading: bool,
@@ -80,6 +83,7 @@ pub enum Next {
 pub enum Msg {
     Jobs(usize, Result<Snapshot, String>), // (cluster uid, result)
     Gpus(usize, Result<HashMap<String, Vec<Gpu>>, String>), // (cluster uid, job id -> GPUs)
+    Capacity(usize, Option<Vec<remote::GpuCapacity>>),
     Log(u64, Result<Option<Log>, String>), // (request id, result)
     Cancelled(String, Result<(), String>),
     PodAction(String, crate::runpod::Action, Result<(), String>),
@@ -174,6 +178,9 @@ impl App {
             outputs: load_outputs(c.label()),
             source: c,
             jobs: None,
+            capacity: None,
+            capacity_loading: false,
+            capacity_checked: None,
             fetched: None,
             error: None,
             loading: false,
@@ -276,12 +283,14 @@ impl App {
 
     pub fn refresh(&mut self) {
         self.refresh_where(|_| true);
+        self.refresh_capacity(true);
     }
 
     /// Refresh each cluster whose own timer has run out, so a slow one doesn't hold up the others.
     pub fn auto_refresh(&mut self) {
         let interval = self.interval();
         self.refresh_where(|c| c.due(interval));
+        self.refresh_capacity(false);
     }
 
     /// Time until the next cluster is due.
@@ -320,6 +329,18 @@ impl App {
         }
     }
 
+    fn refresh_capacity(&mut self, force: bool) {
+        let interval = self.interval();
+        let Some(c) = self.focus.and_then(|i| self.clusters.get_mut(i)) else { return; };
+        if c.source.is_runpod() || c.capacity_loading ||
+            (!force && c.capacity_checked.is_some_and(|t| t.elapsed() < interval)) { return; }
+        c.capacity_loading = true;
+        let (tx, host, uid) = (self.tx.clone(), c.host().to_string(), c.uid);
+        thread::spawn(move || {
+            let _ = tx.send(Msg::Capacity(uid, guarded(|| remote::fetch_capacity(&host)).ok().flatten()));
+        });
+    }
+
     pub fn loading(&self) -> bool {
         self.clusters.iter().any(|c| c.loading)
     }
@@ -342,6 +363,13 @@ impl App {
                 Msg::Gpus(uid, result) => {
                     if let Some(i) = self.clusters.iter().position(|c| c.uid == uid) {
                         self.got_gpus(i, result);
+                    }
+                }
+                Msg::Capacity(uid, capacity) => {
+                    if let Some(c) = self.clusters.iter_mut().find(|c| c.uid == uid) {
+                        c.capacity = capacity;
+                        c.capacity_loading = false;
+                        c.capacity_checked = Some(Instant::now());
                     }
                 }
                 Msg::Fairshare(uid, result) => {
@@ -505,6 +533,7 @@ impl App {
         let want = number.checked_sub(1);
         self.focus = if want == self.focus { None } else { want };
         self.fix_selection();
+        self.refresh_capacity(false);
     }
 
     /// Keep the selection on a visible job; until the user moves, stick to the top one.
@@ -1095,7 +1124,8 @@ mod tests {
 
     fn test_cluster(uid: usize) -> Cluster {
         Cluster {
-            source: ClusterConf { host: "test".into(), ..ClusterConf::default() }, uid, jobs: None, fetched: None,
+            source: ClusterConf { host: "test".into(), ..ClusterConf::default() }, uid, jobs: None,
+            capacity: None, capacity_loading: false, capacity_checked: Some(Instant::now()), fetched: None,
             error: None, loading: false, loading_since: Instant::now(), outputs: HashMap::new(),
             fairshare: None, fairshare_asked: None,
         }
@@ -1149,6 +1179,78 @@ mod tests {
         app.popup = Some(Popup::Help);
         let (_, targets) = render(&app, 140, 26);
         assert!((0..26).all(|y| targets.at(2, y).is_none()));
+    }
+
+    #[test]
+    fn capacity_results_are_cached_without_changing_jobs() {
+        let mut app = App::new(Config::default(), Vec::new());
+        let mut c = test_cluster(7);
+        c.jobs = Some(vec![job("42", "train", "RUNNING")]);
+        c.loading = true;
+        c.capacity_loading = true;
+        c.capacity_checked = None;
+        app.clusters.push(c);
+        app.focus = Some(0);
+        app.refresh_capacity(true); // An in-flight query is not duplicated, even on manual refresh.
+        app.tx.send(Msg::Capacity(7, Some(vec![]))).unwrap();
+        app.receive();
+        let c = &app.clusters[0];
+        assert!(!c.capacity_loading && c.capacity_checked.is_some());
+        assert!(c.loading && c.jobs.as_ref().unwrap()[0].running());
+        app.focus_cluster(0);
+        app.focus_cluster(1);
+        assert!(!app.clusters[0].capacity_loading, "switching back reuses fresh data");
+        app.tx.send(Msg::Capacity(7, None)).unwrap();
+        app.receive();
+        app.refresh_capacity(false);
+        assert!(!app.clusters[0].capacity_loading, "failures wait for the next refresh");
+        assert!(app.clusters[0].capacity.is_none());
+        app.clusters[0].source.provider = crate::config::Provider::Runpod;
+        app.clusters[0].capacity_checked = None;
+        app.refresh_capacity(true);
+        assert!(!app.clusters[0].capacity_loading, "Runpod does not query Slurm");
+    }
+
+    #[test]
+    fn capacity_only_appears_in_the_focused_cluster() {
+        let mut app = App::new(Config::default(), Vec::new());
+        for (uid, kind) in [(0, "a100"), (1, "h200")] {
+            let mut c = test_cluster(uid);
+            c.jobs = Some(vec![job("42", "train", "PENDING")]);
+            c.capacity = Some(vec![remote::GpuCapacity {
+                partition: "gpu".into(), kind: kind.into(), total: 16, allocated: 10, unavailable: 2,
+            }]);
+            app.clusters.push(c);
+        }
+        app.select(0, "42".into());
+        assert!(!screen(&app).contains("10/16"));
+        app.focus_cluster(1);
+        let focused = screen(&app);
+        assert!(focused.contains("gpu  A100") && focused.contains("10/16  4 idle · 2 unavailable"));
+        assert!(!focused.contains("gpu  H200"));
+        // Capacity rows must not shift job click targets onto the wrong row.
+        let (terminal, targets) = render(&app, 140, 26);
+        let y = (0..26).find(|&y| targets.at(2, y).is_some()).unwrap();
+        let line: String = (0..140).map(|x| terminal.backend().buffer()[(x, y)].symbol()).collect();
+        assert!(line.contains("42"));
+        assert!((0..y).all(|row| targets.at(2, row).is_none()));
+        for (w, h) in [(0, 0), (1, 1), (20, 4), (80, 24)] { render(&app, w, h); }
+        app.clusters[0].capacity.as_mut().unwrap().extend((0..30).map(|i| remote::GpuCapacity {
+            partition: format!("gpu{i}"), kind: "a100".into(), total: 4, allocated: 1, unavailable: 0,
+        }));
+        let crowded = screen(&app);
+        assert!(crowded.contains("more GPU groups") && crowded.contains("train"));
+        app.focus_cluster(2);
+        assert!(screen(&app).contains("gpu  H200"));
+        app.focus_cluster(0);
+        assert!(!screen(&app).contains("10/16"));
+        app.focus_cluster(1);
+        app.clusters[0].jobs = Some(vec![]);
+        assert!(screen(&app).contains("10/16"), "capacity is visible without personal jobs");
+        app.clusters[0].capacity = None;
+        assert!(screen(&app).contains("GPU capacity unavailable"));
+        app.clusters[0].capacity = Some(vec![]);
+        assert!(screen(&app).contains("no GPUs reported"));
     }
 
     #[test]
@@ -1434,6 +1536,7 @@ mod tests {
         let cl = |host: &str| crate::config::ClusterConf { host: host.into(), ..Default::default() };
         let config = Config { clusters: vec![cl("a"), cl("b")], ..Config::default() };
         let mut app = App::new(config, Vec::new());
+        for c in &mut app.clusters { c.capacity_checked = Some(Instant::now()); }
         app.clusters[0].jobs = Some(vec![job("1", "x", "RUNNING")]);
         app.clusters[1].jobs = Some(vec![job("2", "y", "RUNNING")]);
         app.fix_selection();

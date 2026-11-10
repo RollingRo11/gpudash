@@ -16,6 +16,9 @@ Running, queued and recently ended jobs from all your clusters, refreshed every 
 Queued jobs show Slurm's estimated start time, in your time zone. Ended jobs show how they
 ended: `✓ done`, `✗ fail`, `✗ oom`, `⏱ time`, `⊘ cncl`.
 
+Press `1`, `2`, `3`… to see a Slurm cluster's GPU capacity by partition and type;
+`r` refreshes it. Partitions can share GPUs; idle counts don't guarantee a job can start.
+
 ### Notifications, so you don't have to watch
 
 ![example gpudash notifications (queued, started, failed)](assets/screenshots/notifications.png)
